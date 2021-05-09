@@ -1,0 +1,7 @@
+src/CASync/dist/*
+src/CASync/horovod.egg-info/
+__pycache__/
+src/CASync/horovod-mxnet/trainResult/
+.vscode
+src/CASync/examples/benchmarks/*.so
+src/CASync/examples/benchmarks/*.o

@@ -1,0 +1,9 @@
+[submodule "deps/tensorflow-ops"]
+	path = deps/tensorflow-ops
+	url = https://gitlab.com/hipress/tensorflow-ops.git
+[submodule "deps/mxnet-1.5.0"]
+	path = deps/mxnet-1.5.0
+	url = https://gitlab.com/hipress/mxnet-1.5.0.git
+[submodule "deps/torch-hipress-extension"]
+	path = deps/torch-hipress-extension
+	url = https://gitlab.com/hipress/torch-hipress-extension.git

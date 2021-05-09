@@ -1,0 +1,14 @@
+void TernGradDecode(uint8* compressed, float* gradient){
+    uint8 bitwidth;
+    uint8 tail;
+    float min;
+    float max;
+    uint<bitwidth>* Q;
+    extract(compressed, bitwidth, tail, min, max, Q);
+    float gap = (max - min) / ((1<<bitwidth) - 1);
+    lambda_func uintToFloat = [&](int index) -> float{
+        return Q[index]*gap + min;
+    }
+    int true_Q_size = Q.size - tail;
+    gradient = map(range(true_Q_size), uintToFloat);
+}

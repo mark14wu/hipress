@@ -1,0 +1,4 @@
+mkdir results
+bash horovodrun.sh 16 egpu1:1,egpu2:1,egpu3:1,egpu4:1,egpu5:1,egpu6:1,egpu7:1,egpu9:1,egpu10:1,egpu11:1,egpu13:1,egpu14:1,egpu15:1,egpu16:1,egpu17:1,egpu18:1   32    1  262144   16777216    resnet50   graddrop   > results/resnet50_graddrop_16node_b32.out
+bash horovodrun.sh 16 egpu1:1,egpu2:1,egpu3:1,egpu4:1,egpu5:1,egpu6:1,egpu7:1,egpu9:1,egpu10:1,egpu11:1,egpu13:1,egpu14:1,egpu15:1,egpu16:1,egpu17:1,egpu18:1   32    1  262144   16777216    resnet50   tbq        > results/resnet50_tbq_16node_b32.out
+bash horovodrun.sh 16 egpu1:1,egpu2:1,egpu3:1,egpu4:1,egpu5:1,egpu6:1,egpu7:1,egpu9:1,egpu10:1,egpu11:1,egpu13:1,egpu14:1,egpu15:1,egpu16:1,egpu17:1,egpu18:1   32    1  262144   16777216    resnet50   terngrad   > results/resnet50_terngrad_16node_b32.out
