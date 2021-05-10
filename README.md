@@ -2,12 +2,11 @@ In this document, we will briefly introduce our framework `HiPress` and mainly f
 
 # What is HiPress?
 
-Gradient synchronization among training nodes has been proved to be a major bottleneck in distributed data parallel DNN training. To eliminate this bottleneck, a number of gradient compression algorithms have been recently proposed, which primarily focus on reducing the amount of gradients exchanged during each training iteration. However, the system challenges of adapting training systems to use these algorithms are often overlooked. First,  the compression-related computational costs accumulate along the gradient synchronization path and are not amortized since the conventional synchronization strategies like Parameter Server (PS) and Ring-allreduce cannot efficiently handle compressed gradients. Consequently, despite of their high compression ratios, when trying out a few open-source implementations within mainstream DNN systems, the performance improvement enabled by gradient compression algorithms is quite limited. Second, gradient compression is not always beneficial due to its non-trivial overhead and its trade-offs with the aforementioned common optimizations, which unfortunately are ignored by current DNN systems. Third, systematic support for compression awareness is lacking. Without such support, a broad adoption of gradient compression becomes difficult because significant system expertise and manual efforts are required for developing, optimizing and integrating each compression algorithm.  
+Gradient synchronization among training nodes has been proved to be a major bottleneck in distributed data parallel DNN training. Gradient compression is a promising approach to alleviating the communication bottleneck in data parallel deep neural network (DNN) training by significantly reducing the data volume of gradients for synchronization. While gradient compression is being actively adopted by the industry (e.g., Facebook and AWS), our study reveals that there are two critical but often overlooked challenges: First, design a generalizable approach to amortize the extra computational overhead brought by gradient compression (e.g., encode and decode operators) along the communication steps during gradient synchronization. This is difficult due to non-trivial factors including, for instance, the data dependencies between gradient computation and communication, the communication topology such as a bipartite graph for PS and a ring for Ring-allreduce, the compression speed and ratio of different compression algorithms, to name a few. Second, provide systematic support for developing, optimizing and integrating gradient compression algorithms into DNN systems.  Without this support, the real-world adoption of gradient compression algorithm requires significant system expertise and manual efforts to perform various ad-hoc development and optimization, which is particularly challenging for DNN practitioners.
 
+To address the above system challenges, We first propose a general, composable gradient synchronization architecture, called `CaSync`, which enables a compression-aware gradient synchronization with a composition of decoupled communication, aggregation and compression primitives. Furthermore, `CaSync` employs a selective compression and partitioning mechanism (named as `SeCoPa` in this project) to decide whether to compress each gradient and how to partition large gradients (before compression) to optimally leverage pipelining and parallel processing. `CaSync` architecture is intentionally designed to be general and not tie to specific gradient compression algorithms and synchronization strategies (e.g., PS or Ring-allreduce), thus, its benefits are applicable to existing and potentially future compression algorithms and synchronization strategies. Second, developing and optimizing gradient compression algorithms on GPU is non-trivial and usually requires significant system expertise and manual efforts. To relieve the burden on DNN practitioners, we design and develop `CompLL`, a gradient compression toolkit which facilitates the easy algorithm development and integration on GPU, including a high-performance gradient compression library, a domain specific language and an automatic code generator, to facilitate the easy and efficient development of compression algorithms on GPU. For easy adoption, we have built a compression-aware data parallel DNN training framework called `HiPress`, with both `CaSync` and `CompLL`. `HiPress` runs with the three mainstream DNN systems (i.e., MXNet, TensorFlow and PyTorch).
 
-To address the above system challenges, we propose `HiPress`, which is a High Performance and Compression-Aware framework for fast data parallel DNN training. In `HiPress`, we first design a new gradient synchronization library called `CaSync`, which  evolves the current PS and Ring-allreduce strategies to become compression-friendly.  Second, we design `SeCoPa`, which makes joint decisions of gradient partition and compression for each gradient of a given DNN model.  Third, we design a toolkit called `CompLL`, including a high-performance gradient compression library, a domain specific language and an automatic code generator, to facilitate the easy and efficient development of compression algorithms on GPU. Finally, to make the gradient compression feature easy-of-use, we build `HiPress` atop mainstream DNN systems such as MXNet, TensorFlow and PyTorch, as well as automate the integration of `CompLL`-generated compression code into the aforementioned DNN systems via `HiPress`.
-
-Currently, `HiPress` supports four built-in compression algorithms, namely, TBQ[1], TernGrad[2], DGC[3], and GradDrop[4]. We specify their logic by following either their open-source implementations or the pseudocode in their original publications. Taking specifications as input, `CompLL` automatically generates the corresponding GPU codes, as well as the necessary code for further integration.
+Currently, `HiPress` supports five built-in compression algorithms, namely, onebit[1], TBQ[2], TernGrad[3], DGC[4], and GradDrop[5]. We specify their logic by following either their open-source implementations or the pseudocode in their original publications. Taking specifications as input, `CompLL` automatically generates the corresponding GPU codes, as well as the necessary code for further integration.
 
 # Try out `HiPress`
  
@@ -17,7 +16,7 @@ Next, we will use the VGG19 model as our `Hello World` example to walk through t
 
 ### Step1: Installing basic common software
 
-We first need to install required software with specific versions. They are  cuda 10.1, cuDNN 7.5.1, MPI 3.1.2, nccl 2.4.2, and [Anaconda3-5.2.0](https://repo.continuum.io/archive/).
+We first need to install required software with specific versions. They are cuda 10.1, cuDNN 7.5.1, MPI 3.1.2, nccl 2.8.4, and [Anaconda3-5.2.0](https://repo.continuum.io/archive/).
 
 ### Step2: Install underlying DNN systems
 
@@ -50,7 +49,7 @@ Then, we need to deploy underlying DNN systems MXNet and TensorFlow, atop of whi
 
 ```bash
 >>> #other pytorch version is ok, but we recommend 1.3.0
->>> pip3 install torch==1.3.0
+>>> pip3 install torch==1.5.0
 >>> #clone the torch-hipress-extension
 >>> git clone https://gitlab.com/hipress/torch-hipress-extension.git
 >>> cd torch-hipress-extension
@@ -147,7 +146,7 @@ To demonstrate that `HiPress` work with DNN systems other than MXNet, here, we p
 
 ## Run `CompLL` for code generation
 
-In addition to the above end-to-end training scripts, here, we present the instructions to run `CompLL` to exercise the auto-generation of gradient compression algorithms. To keep it simple, we take the `encode` function of the TernGrad[2] algorithm as example.
+In addition to the above end-to-end training scripts, here, we present the instructions to run `CompLL` to exercise the auto-generation of gradient compression algorithms. To keep it simple, we take the `encode` function of the TernGrad[3] algorithm as example.
 
 ### Step 1: Specifying logic in DSL language
 
@@ -238,13 +237,15 @@ MXNet training script is as follows.
 
 
 # References
-[1] Nikko Strom. Scalable distributed dnn training using commodity gpu cloud computing. In Proceedings of Sixteenth Annual Conference of the International Speech Communication Association, 2015.
+[1] Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its application to data-paralleldistributed training of speech dnns. InFifteenth Annual Conference ofthe International Speech Communication Association, 2014.
 
-[2] Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai Li. Terngrad: Ternary gradients to reduce communication in distributed deep learning. In Proceedings of Advances in neural information processing systems, pages 1509–1519, 2017.
+[2] Nikko Strom. Scalable distributed dnn training using commodity gpu cloud computing. In Proceedings of Sixteenth Annual Conference of the International Speech Communication Association, 2015.
 
-[3] Yujun Lin, Song Han, Huizi Mao, Yu Wang, and William J Dally. Deep gradient compression: Reducing the communication bandwidth for distributed training. arXiv preprint arXiv:1712.01887, 2017.
+[3] Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai Li. Terngrad: Ternary gradients to reduce communication in distributed deep learning. In Proceedings of Advances in neural information processing systems, pages 1509–1519, 2017.
 
-[4] Alham Fikri Aji and Kenneth Heafield. Sparse communication for distributed gradient descent. arXiv preprint arXiv:1704.05021, 2017.
+[4] Yujun Lin, Song Han, Huizi Mao, Yu Wang, and William J Dally. Deep gradient compression: Reducing the communication bandwidth for distributed training. arXiv preprint arXiv:1712.01887, 2017.
+
+[5] Alham Fikri Aji and Kenneth Heafield. Sparse communication for distributed gradient descent. arXiv preprint arXiv:1704.05021, 2017.
 
 
 
