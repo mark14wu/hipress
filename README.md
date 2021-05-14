@@ -117,10 +117,13 @@ Using the following command, one can easily launch the training job of the VGG19
 ```bash
 >>> cd src/CaSync/horovod-mxnet
 >>> # Check the script help option for more details.
+>>> # Using built-in onebit compression algorithms
+>>> python data_parallel_train.py --numprocess 4 --servers node1:1,node2:1,node3:1,node4:1 --model vgg19 --topo 'PS'  --comp-alg onebit --comprplan '../../SeCoPa/SeCoPaPlan.txt'
+>>> # Using built-in TBQ compression algorithms
 >>> python data_parallel_train.py --numprocess 4 --servers node1:1,node2:1,node3:1,node4:1 --model vgg19 --topo 'PS'  --comp-alg tbq --comprplan '../../SeCoPa/SeCoPaPlan.txt'
 ```
 
-##### 1.2. Training with `CaSync-Ring-allreduce`
+##### 1.2. Training with `CaSync-Ring
 ```bash
 >>> cd src/CaSync/horovod-mxnet
 >>> # Regenerate the SeCoPaPlan choosing Ring as topology first 
