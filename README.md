@@ -12,7 +12,9 @@ Currently, `HiPress` supports five built-in compression algorithms, namely, oneb
  
 Next, we will use the VGG19 model as our `Hello World` example to walk through the whole compression-aware data parallel DNN training procedure. To do so, we will first present instructions to train VGG19 DNN model with `CaSync` and `SeCoPa`, as well as built-in compression algorithms in `HiPress` using MXNet, TensorFlow and PyTorch as the underlying DNN systems, respectively. Second, we will present the instructions to run `CompLL` to generate an exemplified compression algorithm.  Practitioners can then follow our instructions to train their own models and implement more compression algorithms within `HiPress`.  
 
-## Training in `HiPress`
+## Trying `HiPress` from docker
+
+## Trying `HiPress` from source code
 
 ### Step1: Installing basic common software
 
