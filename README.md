@@ -10,11 +10,36 @@ Currently, `HiPress` supports five built-in compression algorithms, namely, oneb
 
 # Try out `HiPress`
  
-Next, we will use the VGG19 model as our `Hello World` example to walk through the whole compression-aware data parallel DNN training procedure. To do so, we will first present instructions to train VGG19 DNN model with `CaSync` and `SeCoPa`, as well as built-in compression algorithms in `HiPress` using MXNet, TensorFlow and PyTorch as the underlying DNN systems, respectively. Second, we will present the instructions to run `CompLL` to generate an exemplified compression algorithm.  Practitioners can then follow our instructions to train their own models and implement more compression algorithms within `HiPress`.  
+Next, we will use the VGG19 model as our `Hello World` example to walk through the whole compression-aware data parallel DNN training procedure. To do so, we will present two methods to explain how to use `HiPress`. First, we present how to use the docker environment to train VGG19 model atop MXNet. Second, we will present the instructions to build `HiPress` from source code and train VGG19 DNN model with `CaSync` and `SeCoPa`, as well as built-in compression algorithms in `HiPress` using MXNet, TensorFlow and PyTorch as the underlying DNN systems, respectively. Third, we will present the instructions to run `CompLL` to generate an exemplified compression algorithm.  Practitioners can then follow our instructions to train their own models and implement more compression algorithms within `HiPress`.  
 
-## Trying `HiPress` from docker
+## Start `HiPress` from docker
 
-## Trying `HiPress` from source code
+### Step1: Initializing the docker environment
+
+We have build an easy-to-use docker environment for `HiPress` atop MXNet, the other backend systems will be commited soon. We first need to make sure that the `nvidia-docker` is running correctly, then use the following commands:
+
+```bash
+>>> docker pull youhuibai/hipress
+>>> nvidia-docker run -itd --name=hipress --net=host -v=/path:/path --privileged=true youhuibai/hipress /usr/sbin/init
+>>> docker exec -it hipress bash
+```
+
+### Step2: Data parallel distributed training 
+#### 1 Training with `CaSync-PS`
+```bash
+>>> cd /root/hipress-mxnet/
+>>> # Check the script help option for more details.
+>>> # Using built-in two bit compression algorithms
+>>> python data_parallel_train.py --numprocess 4 --servers node1:1,node2:1,node3:1,node4:1 --model vgg19 --topo 'PS'  --comp-alg tbq --comp-threshold 262144 --horovodrun --interface [network interface]
+```
+
+#### 2 Training with `CaSync-Ring
+```bash
+>>> cd /root/hipress-mxnet/
+>>> python data_parallel_train.py --numprocess 4 --servers node1:1,node2:1,node3:1,node4:1 --model vgg19 --topo 'Ring'  --comp-alg tbq --comp-threshold 262144 --horovodrun --interface [network interface]
+```
+
+## Start `HiPress` from source code
 
 ### Step1: Installing basic common software
 
