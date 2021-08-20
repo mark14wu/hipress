@@ -16,7 +16,7 @@ Next, we will use the VGG19 model as our `Hello World` example to walk through t
 
 ### Step1: Initializing the docker environment
 
-We have build an easy-to-use docker environment for `HiPress` atop MXNet, the other backend systems will be commited soon. We first need to make sure that the `nvidia-docker` is running correctly, then use the following commands:
+We have build an easy-to-use docker environment for `HiPress` atop MXNet, the other backend systems will be committed soon. We first need to make sure that the `nvidia-docker` is running correctly, then use the following commands:
 
 ```bash
 >>> docker pull youhuibai/hipress
@@ -267,7 +267,7 @@ MXNet training script is as follows.
 
 
 # References
-[1] Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its application to data-paralleldistributed training of speech dnns. InFifteenth Annual Conference ofthe International Speech Communication Association, 2014.
+[1] Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its application to data-parallel distributed training of speech dnns. InFifteenth Annual Conference of the International Speech Communication Association, 2014.
 
 [2] Nikko Strom. Scalable distributed dnn training using commodity gpu cloud computing. In Proceedings of Sixteenth Annual Conference of the International Speech Communication Association, 2015.
 
