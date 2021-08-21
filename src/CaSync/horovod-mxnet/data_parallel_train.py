@@ -42,8 +42,8 @@ def parseArgs():
 	parser.add_argument('--extra', type = str, help = 'add some info by user')
 	parser.add_argument('--usetools', action = 'store_true', help = 'if true, use network tools')
 	parser.add_argument('--profiler', action = 'store_true', help = 'mxnet profile')
-	parser.add_argument('--interface', type = str, default = 'tenGE', choices = ['tenGE', 'ib'],
-								 	 help = 'the environment to execute')
+	parser.add_argument('--interface', type = str, default = 'ens14f1',
+								 	 help = 'the network interface')
 	parser.add_argument('--model', type = str, default = 'resnet50', choices = ['lenet', 'resnet152', 'vgg19', 'inceptionv4', 'resnet50', 'alexnet'],
 								 	 help = 'the training model')
 	parser.add_argument('--bulk', type = int, default = 15,
@@ -227,7 +227,7 @@ class trainingApp:
 		else:
 			train_rec = "/home/gpu/trainData/traindata.rec"
 			train_idx = "/home/gpu/trainData/traindata.idx"
-		cmd = '''./%(horo)s.sh %(numproc)d %(serverset)s %(bsize)d %(examples)d %(model)s %(shape)s %(rec)s %(idx)s %(blk)d %(alg)s %(thr)d %(lenet)s 2>&1 | tee %(path)s/imagenet_ringtrain_%(time)s.log'''%(
+		cmd = '''./%(horo)s.sh %(numproc)d %(serverset)s %(bsize)d %(examples)d %(model)s %(shape)s %(rec)s %(idx)s %(blk)d %(alg)s %(thr)d %(net)s %(lenet)s 2>&1 | tee %(path)s/imagenet_ringtrain_%(time)s.log'''%(
 			{
 				'numproc': parsedArgs.numprocess,
 				'serverset': parsedArgs.servers,
@@ -243,6 +243,7 @@ class trainingApp:
 				'blk' : parsedArgs.bulk,
 				'alg' : parsedArgs.comp_alg,
 				'thr' : parsedArgs.comp_threshold,
+				'net' : parsedArgs.interface,
 				'lenet' : "--lenet" if parsedArgs.lenet else ''
 			})
 		print(cmd)
