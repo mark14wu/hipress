@@ -16,16 +16,28 @@ Next, we will use the VGG19 model as our `Hello World` example to walk through t
 
 ### Step1: Initializing the docker environment
 
-We have build an easy-to-use docker environment for `HiPress` atop MXNet, the other backend systems will be committed soon. We first need to make sure that the `nvidia-docker` is running correctly, then use the following commands:
+We have built an easy-to-use docker environment for `HiPress` atop MXNet, the other backend systems will be committed soon. We first need to make sure that the `nvidia-docker` is running correctly, then use the following commands:
 
 ```bash
 >>> docker pull youhuibai/hipress
+>>> # Start the container on each participant for distributed training
 >>> nvidia-docker run -itd --name=hipress --net=host -v=/path:/path --privileged=true youhuibai/hipress /usr/sbin/init
 >>> docker exec -it hipress bash
 ```
 
 ### Step2: Data parallel distributed training 
-#### 1 Training with `CaSync-PS`
+We have set the default SSH port as `22222`, you have to setup the SSH configure file at `/root/.ssh/config` as the following examples:
+```bash
+Host node1
+        Port 22222
+        HostName [ip address on node1 of interface]
+        User root
+Host node2
+        Port 22222
+        HostName [ip address on node2 of interface]
+        User root
+```
+#### 1. Training with `CaSync-PS`
 ```bash
 >>> cd /root/hipress-mxnet/
 >>> # Check the script help option for more details.
@@ -33,7 +45,7 @@ We have build an easy-to-use docker environment for `HiPress` atop MXNet, the ot
 >>> python data_parallel_train.py --numprocess 4 --servers node1:1,node2:1,node3:1,node4:1 --model vgg19 --topo 'PS'  --comp-alg tbq --comp-threshold 262144 --horovodrun --interface [network interface]
 ```
 
-#### 2 Training with `CaSync-Ring
+#### 2. Training with `CaSync-Ring`
 ```bash
 >>> cd /root/hipress-mxnet/
 >>> python data_parallel_train.py --numprocess 4 --servers node1:1,node2:1,node3:1,node4:1 --model vgg19 --topo 'Ring'  --comp-alg tbq --comp-threshold 262144 --horovodrun --interface [network interface]
