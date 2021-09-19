@@ -276,7 +276,8 @@ MXNet training script is as follows.
 >>> python3 data_parallel_train.py --numprocess 2 --servers host1:1,host2:1 --model vgg19 --comp-threshold 262144 --comp-alg terngrad --horovodrun
 ```
 
-
+# Reproduce the baselines' results
+One can use commands at this [repo](https://gitlab.com/hipress/baselines) to reproduce the end-to-end training throughput in our SOSP'21 paper.
 
 # References
 [1] Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its application to data-parallel distributed training of speech dnns. InFifteenth Annual Conference of the International Speech Communication Association, 2014.
