@@ -220,7 +220,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                                                       dtype=grad.dtype,
                                                       ctx=grad.context))
             
-    def _do_allreduce(self, index, grad, name=None, sf=None,
+    def _do_allreduce(self, index, grad, name=None,
                       comp_cpu=None, comp_gpu=None, residual=None, batchid=0):
         if not isinstance(index, (tuple, list)): # Bert or other nlp models
             index = [index]
@@ -402,14 +402,12 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self._optimizer.update(index, weight, grad, state)
 
     def update_multi_precision(self, index, weight, grad, state,
-                               name=None, sf=None, comp_cpu=None, comp_gpu=None, residual=None, batchid=0):
-        # self._do_allreduce(index, grad, name, sf, # should move to do_allreduce for bert
-        #                    comp_cpu, comp_gpu, residual, batchid=batchid)
+                               name=None, comp_cpu=None, comp_gpu=None, residual=None, batchid=0):
         self._optimizer.update_multi_precision(index, weight, grad, state)
 
     def do_allreduce(self, index, weight, grad, state, name,
-                     sf, comp_cpu, comp_gpu, residual, batchid=0):
-        self._do_allreduce(index, grad, name, sf,
+                     comp_cpu, comp_gpu, residual, batchid=0):
+        self._do_allreduce(index, grad, name,
                            comp_cpu, comp_gpu, residual, batchid=batchid)
 
 
@@ -469,7 +467,14 @@ def broadcast_parameters(params, root_rank=0):
                    broadcasted to all other processes.
     """
     tensors = []
-    if isinstance(params, dict):
+    if isinstance(params, list):
+        for p in params:
+            try:
+                tensors.append(p.data())
+            except mx.gluon.parameter.DeferredInitializationError:
+                new_init = _append_broadcast_init(p, root_rank)
+                p._init_impl = types.MethodType(new_init, p)
+    elif isinstance(params, dict):
         tensors = [p for _, p in sorted(params.items())]
     elif isinstance(params, mx.gluon.parameter.ParameterDict):
         for _, p in sorted(params.items()):
