@@ -41,6 +41,7 @@ import time
 import socket
 import sys
 import logging
+import functools
 
 # This is where Horovod's DistributedOptimizer wrapper for MXNet goes
 class DistributedOptimizer(mx.optimizer.Optimizer):
@@ -68,9 +69,13 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                       for adacomp:
                           T 50 or 500, default is 500
         """
-        sparsity_algs = ['dgc', 'graddrop']
-        quantization_algs = ['tbq', 'ecq', 'terngrad', 'mgc']
-        supported_algs = ['tbq', 'terngrad', 'ecq', 'dgc', 'graddrop', 'adacomp', 'mgc']
+        sparsity_algs = set(['dgc', 'graddrop'])
+        quantization_algs = set(['tbq', 'ecq', 'terngrad', 'mgc'])
+        # low_rank_decomp_algs = set(['powersgd'])
+        low_rank_decomp_algs = set()
+        other_algs = set(['adacomp'])
+        # supported_algs = ['tbq', 'terngrad', 'ecq', 'dgc', 'graddrop', 'adacomp', 'mgc']
+        supported_algs = functools.reduce(set.union, (sparsity_algs, quantization_algs, low_rank_decomp_algs, other_algs))
         self._optimizer = optimizer
 
         self._compress = None
@@ -82,9 +87,11 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self._bits_of_compressed_grad = None
         self._comp_parameters_map = dict()
         self._decomp_parameters_map = dict()
-        self._sparsity = True if comp_alg.lower() in sparsity_algs else False
-        self._quantization = True if self._comp_alg in quantization_algs else False
-        self._do_compression = True if self._comp_alg in supported_algs else False
+
+        self._sparsity = comp_alg.lower() in sparsity_algs
+        self._quantization = self._comp_alg in quantization_algs
+        self._low_rank_decomp = self._comp_alg in low_rank_decomp_algs
+        self._do_compression = self._comp_alg in supported_algs
         self._compression_rate = 0.0
 
         self._comp_parameters_map = {'tbq':{}, 'terngrad':{}, 'ecq':{}, 'dgc':{}, 'graddrop':{}, 'adacomp':{}, 'mgc':{}}
@@ -206,6 +213,21 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self._comp_gpus[index] = list()
         self._comp_cpus[index] = list()
         self._resd_gpus[index] = list()
+
+        interval = grad.size
+
+        self._comp_gpus[index].append(mx.nd.zeros(shape=interval*5, dtype='uint8', ctx=grad.context))
+
+        self._comp_cpus[index].append(mx.nd.zeros(shape=interval*8, dtype='uint8', ctx=mx.context.cpu_pinned()))
+
+        self._resd_gpus[index].append(mx.nd.zeros(shape=interval, dtype=grad.dtype, ctx=grad.context))
+
+    def partition_initialize(self, index, grad):
+        if index in self._comp_gpus: # initialized
+            return
+        self._comp_gpus[index] = list()
+        self._comp_cpus[index] = list()
+        self._resd_gpus[index] = list()
         interval = grad.size // size()
         for i in range(size()):
             if i == size() - 1:
@@ -219,196 +241,179 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
             self._resd_gpus[index].append(mx.nd.zeros(shape=interval,
                                                       dtype=grad.dtype,
                                                       ctx=grad.context))
-            
-    def _do_allreduce(self, index, grad, name=None,
-                      comp_cpu=None, comp_gpu=None, residual=None, batchid=0):
+
+    def _do_partition_allreduce(self, i, index, grad, batchid=0):
+        self.partition_initialize(index[i], grad[i])
+        # partition and do compression and gather
+        interval = grad[i].size // size()
+        for part_root in range(size()):
+            start = part_root * interval
+            end = (part_root+1) * interval
+            if part_root == size()-1:
+                end = grad[i].size
+                interval += grad[i].size%size()
+            compressed_size = int((self._bits_of_compressed_grad(interval)+7)/8) # ceil in uint8
+            if rank() != part_root: # do compression
+                self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)[start:end]
+                self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]][part_root]
+                if self._residual:
+                    self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[index[i]][part_root]
+                self._compress(**self._comp_parameters_map[self._comp_alg])
+                self._comp_gpus[index[i]][part_root][:compressed_size].copyto(
+                    self._comp_cpus[index[i]][part_root][:compressed_size])
+            gather_(self._comp_cpus[index[i]][part_root], self._comp_cpus[index[i]][part_root],
+                    grad[i], part_root, num_elem=compressed_size, name=str(index[i])+"-"+str(part_root), batchid=batchid)
+
+        # partition and do decompression at root and bcast
+        interval = grad[i].size // size()
+        for part_root in range(size()):
+            start = part_root * interval
+            end = (part_root+1) * interval
+            if part_root == size()-1:
+                end = grad[i].size
+                interval += grad[i].size%size()
+            compressed_size = int((self._bits_of_compressed_grad(interval)+7)/8) # ceil in uint8
+            if rank() == part_root:
+                tail = interval%4; tail = 0 if tail == 0 else 4 - tail
+                for idx in range(size()):
+                    if idx != part_root:
+                        begin = idx * compressed_size; stop = begin + compressed_size
+                        self._comp_cpus[index[i]][part_root][begin:stop].copyto(
+                            self._comp_gpus[index[i]][part_root][:compressed_size])
+                        self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[index[i]][part_root][:compressed_size]
+                        self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 1
+                        self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)[start:end]
+                        self._decomp_parameters_map['ecq']['is_add_to'] = 0
+                        self._decomp_parameters_map['terngrad']['tail'] = tail
+                        self._decompress(**self._decomp_parameters_map[self._comp_alg])
+                self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)[start:end]
+                self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]][part_root]
+                if self._residual:
+                    self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[index[i]][part_root]
+                self._compress(**self._comp_parameters_map[self._comp_alg])
+                self._comp_gpus[index[i]][part_root][:compressed_size].copyto(
+                    self._comp_cpus[index[i]][part_root][:compressed_size])
+            mpibroadcast_(self._comp_cpus[index[i]][part_root], part_root,
+                            num_elem=compressed_size, name=str(index[i])+'-'+str(part_root),
+                            batchid=batchid)
+
+        # partition and do decompression at non root
+        interval = grad[i].size // size()
+        for part_root in range(size()):
+            start = part_root * interval
+            end = (part_root+1) * interval
+            if part_root == size()-1:
+                end = grad[i].size
+                interval += grad[i].size%size()
+            compressed_size = int((self._bits_of_compressed_grad(interval)+7)/8) # ceil in uint8
+            if rank() != part_root:
+                self._comp_cpus[index[i]][part_root][:compressed_size].copyto(
+                    self._comp_gpus[index[i]][part_root][:compressed_size])
+                self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[index[i]][part_root][:compressed_size]
+                self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 0
+                self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)[start:end]
+                tail = interval%4; tail = 0 if tail == 0 else 4 - tail
+                self._decomp_parameters_map['terngrad']['tail'] = tail
+                self._decompress(**self._decomp_parameters_map[self._comp_alg])
+        grad[i].__idiv__(size())
+
+    def _do_allreduce(self, i, index, grad, batchid=0):
+        self.initialize(index[i], grad[i])
+        if self._sparsity:
+            assert self._compression_rate(size()) < 0.5, "compression rate too large! may use quantization."
+        assert self._bits_of_compressed_grad(grad[i].size) <= 8*self._comp_cpus[i].size, "need more space for gathering!"
+
+        index = list(index)
+        # index[i] = self._key_start
+        # self._key_start += 1
+        rootid = index[i]%size()
+        # rootid = 0
+        compressed_size = int((self._bits_of_compressed_grad(grad[i].size)+7)/8) # ceil in uint8
+        # compressed_size can be extracted from compressed data
+        if rank() != rootid:
+            self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
+            self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[i]
+            if self._residual:
+                self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[i]
+            self._compress(**self._comp_parameters_map[self._comp_alg])
+            self._comp_gpus[i][:compressed_size].copyto(self._comp_cpus[i][:compressed_size])
+            # print(socket.gethostname(), comp_cpu[i][0:4])
+
+        gather_(self._comp_cpus[i], self._comp_cpus[i], grad[i], rootid, 
+                num_elem=compressed_size, name=str(index[i]), batchid=batchid)
+
+        if self._sparsity:
+            compressed_size_new = self._bits_of_compressed_grad(grad[i].size*size())/8 # in uint8
+        else:
+            compressed_size_new = compressed_size
+        compressed_size_new = int(compressed_size_new)
+
+        if rank() == rootid:
+            tail = grad[i].size%4; tail = 0 if tail==0 else 4-tail # for terngrad
+            for idx in range(size()):
+                if idx != rootid:
+                    start = idx*compressed_size; offset = start+compressed_size
+                    self._comp_cpus[i][start:offset].copyto(self._comp_gpus[i][:compressed_size])
+                    self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[i][:compressed_size]
+                    self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 1
+                    self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)
+                    self._decomp_parameters_map['ecq']['is_add_to'] = 0
+                    self._decomp_parameters_map['terngrad']['tail'] = tail # only for terngrad
+                    self._decompress(**self._decomp_parameters_map[self._comp_alg])
+
+            if self._sparsity:
+                if self._comp_alg == 'dgc':
+                    self._comp_parameters_map['dgc']['s_percent'] *= size()
+                elif self._comp_alg == 'graddrop':
+                    self._comp_parameters_map['graddrop']['drop_ratio'] \
+                        -= (1-self._comp_parameters_map['graddrop']['drop_ratio'])*(size()-1)
+
+            self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
+            self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[i]
+            if self._residual:
+                self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[i]
+            self._compress(**self._comp_parameters_map[self._comp_alg])
+            self._comp_gpus[i][:compressed_size_new].copyto(self._comp_cpus[i][:compressed_size_new])
+
+            if self._sparsity and self._compression_rate(size()) < 0.5:
+                if self._comp_alg == 'dgc':
+                    self._comp_parameters_map['dgc']['s_percent'] = self._param_tmp
+                elif self._comp_alg == 'graddrop':
+                    self._comp_parameters_map['graddrop']['drop_ratio'] = self._param_tmp
+        mpibroadcast_(self._comp_cpus[i], rootid, num_elem=compressed_size_new, name=str(index[i]), batchid=batchid)
+
+        if rank() != rootid:
+            self._comp_cpus[i][:compressed_size_new].copyto(self._comp_gpus[i][:compressed_size_new])
+            self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[i][:compressed_size_new]
+            self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 0
+            self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)
+            tail = grad[i].size % 4; tail = 0 if tail == 0 else 4-tail # only for terngrad
+            self._decomp_parameters_map['terngrad']['tail'] = tail
+
+            self._decompress(**self._decomp_parameters_map[self._comp_alg])
+        grad[i].__idiv__(size()) # average
+        # record_timestamp([grad[i], comp_cpu[i]], tensor_name=str(index[i]), op_name="EDECOMP", args=str(batchid))
+
+
+    def update(self, index, weight, grad, state):
+        raise NotImplementedError()
+
+    def update_multi_precision(self, index, weight, grad, state):
+        self._optimizer.update_multi_precision(index, weight, grad, state)
+
+    def do_allreduce(self, index, weight, grad, state, batchid=0):
         if not isinstance(index, (tuple, list)): # Bert or other nlp models
             index = [index]
             grad = [grad]
-            comp_cpu = [comp_cpu]
-            comp_gpu = [comp_gpu]
-            residual = [residual]
         for i in range(len(index)):
-            # record_timestamp([grad[i]], tensor_name=str(index[i]), op_name="ENDBWD", args=str(batchid))
-            if self._do_compression:
-                if grad[i].size >= self._threshold:
-                    if self._quantization and grad[i].size*4 >= self._partition_byte: # partition the gradient
-                        self.initialize(index[i], grad[i])
-
-                        # partition and do compression and gather
-                        interval = grad[i].size // size()
-                        for part_root in range(size()):
-                            start = part_root * interval
-                            end = (part_root+1) * interval
-                            if part_root == size()-1:
-                                end = grad[i].size
-                                interval += grad[i].size%size()
-                            compressed_size = int((self._bits_of_compressed_grad(interval)+7)/8) # ceil in uint8
-                            if rank() != part_root: # do compression
-                                self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)[start:end]
-                                self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]][part_root]
-                                if self._residual:
-                                    self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[index[i]][part_root]
-                                self._compress(**self._comp_parameters_map[self._comp_alg])
-                                self._comp_gpus[index[i]][part_root][:compressed_size].copyto(
-                                    self._comp_cpus[index[i]][part_root][:compressed_size])
-                            gather_(self._comp_cpus[index[i]][part_root], self._comp_cpus[index[i]][part_root],
-                                    grad[i], part_root, num_elem=compressed_size, name=str(index[i])+"-"+str(part_root), batchid=batchid)
-                        
-                        # partition and do decompression at root and bcast
-                        interval = grad[i].size // size()
-                        for part_root in range(size()):
-                            start = part_root * interval
-                            end = (part_root+1) * interval
-                            if part_root == size()-1:
-                                end = grad[i].size
-                                interval += grad[i].size%size()
-                            compressed_size = int((self._bits_of_compressed_grad(interval)+7)/8) # ceil in uint8
-                            if rank() == part_root:
-                                tail = interval%4; tail = 0 if tail == 0 else 4 - tail
-                                for idx in range(size()):
-                                    if idx != part_root:
-                                        begin = idx * compressed_size; stop = begin + compressed_size
-                                        self._comp_cpus[index[i]][part_root][begin:stop].copyto(
-                                            self._comp_gpus[index[i]][part_root][:compressed_size])
-                                        self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[index[i]][part_root][:compressed_size]
-                                        self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 1
-                                        self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)[start:end]
-                                        self._decomp_parameters_map['ecq']['is_add_to'] = 0
-                                        self._decomp_parameters_map['terngrad']['tail'] = tail
-                                        self._decompress(**self._decomp_parameters_map[self._comp_alg])
-                                self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)[start:end]
-                                self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]][part_root]
-                                if self._residual:
-                                    self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[index[i]][part_root]
-                                self._compress(**self._comp_parameters_map[self._comp_alg])
-                                self._comp_gpus[index[i]][part_root][:compressed_size].copyto(
-                                    self._comp_cpus[index[i]][part_root][:compressed_size])
-                            mpibroadcast_(self._comp_cpus[index[i]][part_root], part_root,
-                                            num_elem=compressed_size, name=str(index[i])+'-'+str(part_root),
-                                            batchid=batchid)
-                        
-                        # partition and do decompression at non root
-                        interval = grad[i].size // size()
-                        for part_root in range(size()):
-                            start = part_root * interval
-                            end = (part_root+1) * interval
-                            if part_root == size()-1:
-                                end = grad[i].size
-                                interval += grad[i].size%size()
-                            compressed_size = int((self._bits_of_compressed_grad(interval)+7)/8) # ceil in uint8
-                            if rank() != part_root:
-                                self._comp_cpus[index[i]][part_root][:compressed_size].copyto(
-                                    self._comp_gpus[index[i]][part_root][:compressed_size])
-                                self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[index[i]][part_root][:compressed_size]
-                                self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 0
-                                self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)[start:end]
-                                tail = interval%4; tail = 0 if tail == 0 else 4 - tail
-                                self._decomp_parameters_map['terngrad']['tail'] = tail
-                                self._decompress(**self._decomp_parameters_map[self._comp_alg])
-                        grad[i].__idiv__(size())
-                    else:
-                        index = list(index)
-                        # index[i] = self._key_start
-                        # self._key_start += 1
-                        if self._bits_of_compressed_grad(grad[i].size) <= 8*comp_cpu[i].size: # can be gathereds
-                            rootid = index[i]%size()
-                            # rootid = 0
-                            compressed_size = int((self._bits_of_compressed_grad(grad[i].size)+7)/8) # ceil in uint8
-                            # compressed_size can be extracted from compressed data
-                            if rank() != rootid:
-                                self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
-                                self._comp_parameters_map[self._comp_alg]['out'] = comp_gpu[i]
-                                if self._residual:
-                                    self._comp_parameters_map[self._comp_alg]['residual'] = residual[i]
-                                self._compress(**self._comp_parameters_map[self._comp_alg])
-                                comp_gpu[i][:compressed_size].copyto(comp_cpu[i][:compressed_size])
-                                # print(socket.gethostname(), comp_cpu[i][0:4])
-                            
-                            gather_(comp_cpu[i], comp_cpu[i], grad[i], rootid, 
-                                    num_elem=compressed_size, name=str(index[i]), batchid=batchid)
-
-                            if self._sparsity:
-                                if self._compression_rate(size()) < 0.5:
-                                    compressed_size_new = self._bits_of_compressed_grad(grad[i].size*size())/8 # in uint8
-                                else:
-                                    logging.error("may use quantization")
-                            else:
-                                compressed_size_new = compressed_size
-                            compressed_size_new = int(compressed_size_new)
-
-                            if rank() == rootid:
-                                tail = grad[i].size%4; tail = 0 if tail==0 else 4-tail # for terngrad
-                                for idx in range(size()):
-                                    if idx != rootid:
-                                        start = idx*compressed_size; offset = start+compressed_size
-                                        comp_cpu[i][start:offset].copyto(comp_gpu[i][:compressed_size])
-                                        self._decomp_parameters_map[self._comp_alg]['data'] = comp_gpu[i][:compressed_size]
-                                        self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 1
-                                        self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)
-                                        self._decomp_parameters_map['ecq']['is_add_to'] = 0
-                                        self._decomp_parameters_map['terngrad']['tail'] = tail # only for terngrad
-                                        self._decompress(**self._decomp_parameters_map[self._comp_alg])
-
-                                if self._sparsity:
-                                    if self._compression_rate(size()) < 0.5: # compression staill make sense
-                                        if self._comp_alg == 'dgc':
-                                            self._comp_parameters_map['dgc']['s_percent'] *= size()
-                                        elif self._comp_alg == 'graddrop':
-                                            self._comp_parameters_map['graddrop']['drop_ratio'] \
-                                                -= (1-self._comp_parameters_map['graddrop']['drop_ratio'])*(size()-1)
-                                    else:
-                                        logging.error("may use quantization")
-
-                                self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
-                                self._comp_parameters_map[self._comp_alg]['out'] = comp_gpu[i]
-                                if self._residual:
-                                    self._comp_parameters_map[self._comp_alg]['residual'] = residual[i]
-                                self._compress(**self._comp_parameters_map[self._comp_alg])
-                                comp_gpu[i][:compressed_size_new].copyto(comp_cpu[i][:compressed_size_new])
-
-                                if self._sparsity and self._compression_rate(size()) < 0.5:
-                                    if self._comp_alg == 'dgc':
-                                        self._comp_parameters_map['dgc']['s_percent'] = self._param_tmp
-                                    elif self._comp_alg == 'graddrop':
-                                        self._comp_parameters_map['graddrop']['drop_ratio'] = self._param_tmp
-                            mpibroadcast_(comp_cpu[i], rootid, num_elem=compressed_size_new, name=str(index[i]), batchid=batchid)
-
-                            if rank() != rootid:
-                                if self._sparsity:
-                                    if self._compression_rate(size()) >= 0.5:
-                                        logging.error("may use quantization")
-                                comp_cpu[i][:compressed_size_new].copyto(comp_gpu[i][:compressed_size_new])
-                                self._decomp_parameters_map[self._comp_alg]['data'] = comp_gpu[i][:compressed_size_new]
-                                self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 0
-                                self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)
-                                tail = grad[i].size % 4; tail = 0 if tail == 0 else 4-tail # only for terngrad
-                                self._decomp_parameters_map['terngrad']['tail'] = tail
-
-                                self._decompress(**self._decomp_parameters_map[self._comp_alg])
-                            grad[i].__idiv__(size()) # average
-                            # record_timestamp([grad[i], comp_cpu[i]], tensor_name=str(index[i]), op_name="EDECOMP", args=str(batchid))
-                        else:
-                            logging.error("more space for gathering")
+            if self._do_compression and grad[i].size >= self._threshold:
+                if self._quantization and grad[i].size*4 >= self._partition_byte:
+                    self._do_partition_allreduce(i, index, grad, batchid=batchid)
                 else:
-                    allreduce_(grad[i], average=True, name=str(index[i]), batchid=batchid)
-                    # record_timestamp([grad[i]], tensor_name=str(index[i]), op_name="BUPDATE", args=str(batchid))
+                    self._do_allreduce(i, index, grad, batchid=batchid)
             else:
                 allreduce_(grad[i], average=True, name=str(index[i]), batchid=batchid)
                 # record_timestamp([grad[i]], tensor_name=str(index[i]), op_name="BUPDATE", args=str(batchid))
-
-    def update(self, index, weight, grad, state):
-        self._do_allreduce(index, grad)
-        self._optimizer.update(index, weight, grad, state)
-
-    def update_multi_precision(self, index, weight, grad, state,
-                               name=None, comp_cpu=None, comp_gpu=None, residual=None, batchid=0):
-        self._optimizer.update_multi_precision(index, weight, grad, state)
-
-    def do_allreduce(self, index, weight, grad, state, name,
-                     comp_cpu, comp_gpu, residual, batchid=0):
-        self._do_allreduce(index, grad, name,
-                           comp_cpu, comp_gpu, residual, batchid=batchid)
 
 
     def set_learning_rate(self, lr):
