@@ -73,7 +73,12 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         quantization_algs = set(['tbq', 'ecq', 'terngrad', 'mgc'])
         low_rank_decomp_algs = set(['powersgd'])
         other_algs = set(['adacomp'])
-        supported_algs = functools.reduce(set.union, (sparsity_algs, quantization_algs, low_rank_decomp_algs, other_algs))
+        supported_algs = functools.reduce(set.union, [
+            sparsity_algs,
+            quantization_algs,
+            low_rank_decomp_algs,
+            other_algs
+        ])
         self._optimizer = optimizer
 
         self._compress = None
@@ -446,6 +451,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         raise NotImplementedError()
 
     def update_multi_precision(self, index, weight, grad, state):
+        self.do_allreduce(index, weight, grad, state)
         self._optimizer.update_multi_precision(index, weight, grad, state)
 
     def do_allreduce(self, index, weight, grad, state, batchid=0):
