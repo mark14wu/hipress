@@ -30,7 +30,11 @@ from horovod.mxnet.mpi_ops import gather_
 from horovod.mxnet.mpi_ops import init, shutdown
 from horovod.mxnet.mpi_ops import size, local_size, rank, local_rank
 from horovod.mxnet.mpi_ops import mpi_threads_supported
-from horovod.mxnet.mpi_ops import record_timestamp
+
+from horovod.mxnet.gradcomp import GradientCompressEngine
+from horovod.mxnet.gradcomp.compressor.dgc import DgcCompressor
+from horovod.mxnet.gradcomp.compressor.topkadam import TopKAdamCompressor
+from horovod.mxnet.gradcomp.compressor.powersgd import PowerSGDCompressor
 
 import mxnet as mx
 import types
@@ -69,7 +73,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                       for adacomp:
                           T 50 or 500, default is 500
         """
-        sparsity_algs = set(['dgc', 'graddrop'])
+        sparsity_algs = set(['dgc', 'graddrop', 'topkadam'])
         quantization_algs = set(['tbq', 'ecq', 'terngrad', 'mgc'])
         low_rank_decomp_algs = set(['powersgd'])
         other_algs = set(['adacomp'])
@@ -79,6 +83,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
             low_rank_decomp_algs,
             other_algs
         ])
+        optimizer_compression_algs = set(['topkadam'])
         self._optimizer = optimizer
 
         self._compress = None
@@ -91,10 +96,11 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self._comp_parameters_map = dict()
         self._decomp_parameters_map = dict()
 
-        self._sparsity = comp_alg.lower() in sparsity_algs
+        self._sparsity = self._comp_alg in sparsity_algs
         self._quantization = self._comp_alg in quantization_algs
         self._low_rank_decomp = self._comp_alg in low_rank_decomp_algs
         self._do_compression = self._comp_alg in supported_algs
+        self._optimizer_compression = self._comp_alg in optimizer_compression_algs
         self._compression_rate = 0.0
 
         self._comp_parameters_map = {'tbq':{}, 'terngrad':{}, 'ecq':{}, 'dgc':{}, 'graddrop':{}, 'adacomp':{}, 'mgc':{}}
@@ -105,9 +111,12 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self._comp_cpus = dict() # from keyid to partitioned compressed gradients on cpu
         self._resd_gpus = dict() # from keyid to partitioned residuals
         self._powersgd_M_gpus = dict() # used for powersgd only
+        self._q_memory = dict()
+        self._p_memory = dict()
 
         self._key_start = 1000
 
+        self.engine = None
 
         print("init optimizer:", self._comp_alg, self._threshold, self._sparsity, self._do_compression)
 
@@ -146,20 +155,19 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                 self._comp_parameters_map['ecq']['beta'] = 0.9
                 self._comp_parameters_map['ecq']['bitwidth'] = 2
                 self._compression_rate = 2/32
-            elif self._comp_alg == 'dgc':
+            elif self._comp_alg == 'dgc':                
                 self._compress = mx.nd.contrib.dgc_new
                 self._decompress = mx.nd.contrib.dgc_new_r
-                self._s_percent = 0.001
-                self._sample_rate = 0.001
-                self._bits_of_compressed_grad = lambda x: (2*math.ceil(x*self._s_percent)+1)*32 # in float
-                if 's_percent' in kwargs.keys():
-                    self._s_percent = kwargs['s_percent']
-                if 'sample_rate' in kwargs.keys():
-                    self._sample_rate = kwargs['sample_rate']
+                self._bits_of_compressed_grad = lambda x: (2*math.ceil(x*self._s_percent)+1)*32 # in float                
+                self._s_percent = kwargs['s_percent'] if 's_percent' in kwargs.keys() else 0.001                
+                self._sample_rate = kwargs['sample_rate'] if 'sample_rate' in kwargs.keys() else 0.001
                 self._comp_parameters_map['dgc']['s_percent'] = self._s_percent
                 self._comp_parameters_map['dgc']['sample_rate'] = self._sample_rate
                 self._param_tmp = self._s_percent
                 self._compression_rate = lambda x: x*self._s_percent
+                self.engine = GradientCompressEngine(
+                    compressor=DgcCompressor(s_percent=self._s_percent, sample_rate=self._sample_rate)
+                )
             elif self._comp_alg == 'graddrop':
                 self._compress = mx.nd.contrib.scdgd
                 self._decompress = mx.nd.contrib.scdgd_r
@@ -175,6 +183,10 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                 self._comp_parameters_map['graddrop']['sample_rate'] = self._sample_rate
                 self._param_tmp = self._drop_ratio
                 self._compression_rate = lambda x: x*(1-self._drop_ratio)
+            elif self._comp_alg == 'topkadam':
+                self.engine = GradientCompressEngine(
+                    compressor=TopKAdamCompressor(optimizer=self._optimizer)
+                )
             elif self._comp_alg == 'adacomp':
                 self._compress = mx.nd.contrib.ada_comp
                 self._decompress = mx.nd.contrib.ada_comp_r
@@ -193,6 +205,9 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                     self._decomp_rank = kwargs['rank']
                 else:
                     self._decomp_rank = 4
+                self.engine = GradientCompressEngine(
+                    compressor=PowerSGDCompressor(decomp_rank=self._decomp_rank)
+                )
             else:
                 warnings.warn("The compression algorith %s is not supported right now"%(self._comp_alg))
     
@@ -222,15 +237,10 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
     def initialize(self, index, grad):
         if index in self._comp_gpus: # initialized
             return
-        self._comp_gpus[index] = list()
-        self._comp_cpus[index] = list()
-        self._resd_gpus[index] = list()
-
         interval = grad.size
-
-        self._comp_gpus[index].append(mx.nd.zeros(shape=interval*5, dtype='uint8', ctx=grad.context))
-        self._comp_cpus[index].append(mx.nd.zeros(shape=interval*8, dtype='uint8', ctx=mx.context.cpu_pinned()))
-        self._resd_gpus[index].append(mx.nd.zeros(shape=interval, dtype=grad.dtype, ctx=grad.context))
+        self._comp_gpus[index] = mx.nd.zeros(shape=interval*5, dtype='uint8', ctx=grad.context)
+        self._comp_cpus[index] = mx.nd.zeros(shape=interval*8, dtype='uint8', ctx=mx.context.cpu_pinned())
+        self._resd_gpus[index] = mx.nd.zeros(shape=interval, dtype=grad.dtype, ctx=grad.context)
 
     def partition_initialize(self, index, grad):
         if index in self._comp_gpus: # initialized
@@ -251,49 +261,6 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
             self._resd_gpus[index].append(mx.nd.zeros(shape=interval,
                                                       dtype=grad.dtype,
                                                       ctx=grad.context))
-
-    def powersgd_initialize(self, index, grad):
-        if index in self._comp_gpus: # initialized
-            return
-
-        # view grad as 2-D matrix(M) with square shape
-        interval = math.ceil(math.sqrt(grad.size))
-
-        self._comp_gpus[index] = mx.nd.zeros(shape=(interval, self._decomp_rank), dtype=grad.dtype, ctx=grad.context)
-        self._comp_cpus[index] = mx.nd.zeros(shape=(interval, self._decomp_rank), dtype=grad.dtype, ctx=mx.context.cpu_pinned())
-        # TODO: initialize resd gpus with random seed
-        self._resd_gpus[index] = mx.nd.zeros(shape=(interval, self._decomp_rank), dtype=grad.dtype, ctx=grad.context)
-        self._powersgd_M_gpus[index] = mx.nd.zeros(shape=(interval, interval), dtype=grad.dtype, ctx=grad.context)
-
-    def _do_powersgd_allreduce(self, index, grad, batchid=0):
-        # init comp buffers and residuals
-        self.powersgd_initialize(index, grad)
-
-        # copy grad to M
-        M = self._powersgd_M_gpus[index]
-        grad.reshape(grad.size).copyto(M.reshape(M.size)[:grad.size])
-
-        # P = M * Q(resd)
-        mx.nd.dot(M, self._resd_gpus[index]).copyto(self._comp_cpus[index])
-
-        # allreduce P
-        allreduce_(self._comp_cpus[index], average=True, name=str(index), batchid=batchid)
-        self._comp_cpus[index].copyto(self._comp_gpus[index])
-
-        # P = Orthogonalize(P)
-        P, _ = mx.np.linalg.qr(self._comp_gpus[index].as_np_ndarray())
-        P.as_nd_ndarray().copyto(self._comp_gpus[index])
-
-        # Q = M^T * P
-        mx.nd.dot(M, self._comp_gpus[index], transpose_a=True).copyto(self._comp_cpus[index])
-
-        # allreduce Q
-        allreduce_(self._comp_cpus[index], average=True, name=str(index), batchid=batchid)
-        self._comp_cpus[index].copyto(self._resd_gpus[index])
-
-        # M = P * Q^T, then truncate M to size of grad
-        M = mx.nd.dot(self._comp_gpus[index], self._resd_gpus[index], transpose_b=True)
-        M.reshape(M.size)[:grad.size].copyto(grad.reshape(grad.size))
 
     def _do_partition_allreduce(self, i, index, grad, batchid=0):
         self.partition_initialize(index[i], grad[i])
@@ -374,7 +341,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self.initialize(index[i], grad[i])
         if self._sparsity:
             assert self._compression_rate(size()) < 0.5, "compression rate too large! may use quantization."
-        assert self._bits_of_compressed_grad(grad[i].size) <= 8*self._comp_cpus[i].size, "need more space for gathering!"
+        assert self._bits_of_compressed_grad(grad[i].size) <= 8*self._comp_cpus[index[i]].size, "need more space for gathering!"
 
         index = list(index)
         # index[i] = self._key_start
@@ -385,14 +352,13 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         # compressed_size can be extracted from compressed data
         if rank() != rootid:
             self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
-            self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[i]
+            self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]]
             if self._residual:
                 self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[i]
             self._compress(**self._comp_parameters_map[self._comp_alg])
-            self._comp_gpus[i][:compressed_size].copyto(self._comp_cpus[i][:compressed_size])
+            self._comp_gpus[index[i]][:compressed_size].copyto(self._comp_cpus[index[i]][:compressed_size])
             # print(socket.gethostname(), comp_cpu[i][0:4])
-
-        gather_(self._comp_cpus[i], self._comp_cpus[i], grad[i], rootid, 
+        gather_(self._comp_cpus[index[i]], self._comp_cpus[index[i]], grad[i], rootid, 
                 num_elem=compressed_size, name=str(index[i]), batchid=batchid)
 
         if self._sparsity:
@@ -406,8 +372,8 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
             for idx in range(size()):
                 if idx != rootid:
                     start = idx*compressed_size; offset = start+compressed_size
-                    self._comp_cpus[i][start:offset].copyto(self._comp_gpus[i][:compressed_size])
-                    self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[i][:compressed_size]
+                    self._comp_cpus[index[i]][start:offset].copyto(self._comp_gpus[index[i]][:compressed_size])
+                    self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[index[i]][:compressed_size]
                     self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 1
                     self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)
                     self._decomp_parameters_map['ecq']['is_add_to'] = 0
@@ -422,22 +388,22 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                         -= (1-self._comp_parameters_map['graddrop']['drop_ratio'])*(size()-1)
 
             self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
-            self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[i]
+            self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]]
             if self._residual:
                 self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[i]
             self._compress(**self._comp_parameters_map[self._comp_alg])
-            self._comp_gpus[i][:compressed_size_new].copyto(self._comp_cpus[i][:compressed_size_new])
+            self._comp_gpus[index[i]][:compressed_size_new].copyto(self._comp_cpus[index[i]][:compressed_size_new])
 
             if self._sparsity and self._compression_rate(size()) < 0.5:
                 if self._comp_alg == 'dgc':
                     self._comp_parameters_map['dgc']['s_percent'] = self._param_tmp
                 elif self._comp_alg == 'graddrop':
                     self._comp_parameters_map['graddrop']['drop_ratio'] = self._param_tmp
-        mpibroadcast_(self._comp_cpus[i], rootid, num_elem=compressed_size_new, name=str(index[i]), batchid=batchid)
+        mpibroadcast_(self._comp_cpus[index[i]], rootid, num_elem=compressed_size_new, name=str(index[i]), batchid=batchid)
 
         if rank() != rootid:
-            self._comp_cpus[i][:compressed_size_new].copyto(self._comp_gpus[i][:compressed_size_new])
-            self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[i][:compressed_size_new]
+            self._comp_cpus[index[i]][:compressed_size_new].copyto(self._comp_gpus[index[i]][:compressed_size_new])
+            self._decomp_parameters_map[self._comp_alg]['data'] = self._comp_gpus[index[i]][:compressed_size_new]
             self._decomp_parameters_map[self._comp_alg]['is_add_to'] = 0
             self._decomp_parameters_map[self._comp_alg]['out'] = grad[i].reshape(grad[i].size)
             tail = grad[i].size % 4; tail = 0 if tail == 0 else 4-tail # only for terngrad
@@ -445,16 +411,17 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
 
             self._decompress(**self._decomp_parameters_map[self._comp_alg])
         grad[i].__idiv__(size()) # average
-        # record_timestamp([grad[i], comp_cpu[i]], tensor_name=str(index[i]), op_name="EDECOMP", args=str(batchid))
 
     def update(self, index, weight, grad, state):
         raise NotImplementedError()
 
     def update_multi_precision(self, index, weight, grad, state):
-        self.do_allreduce(index, weight, grad, state)
+        self.do_allreduce(index, grad, state)
+        if self._optimizer_compression:
+            pass
         self._optimizer.update_multi_precision(index, weight, grad, state)
 
-    def do_allreduce(self, index, weight, grad, state, batchid=0):
+    def do_allreduce(self, index, grad, state, batchid=0):
         if not isinstance(index, (tuple, list)): # Bert or other nlp models
             index = [index]
             grad = [grad]
@@ -462,16 +429,12 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
             if self._do_compression and grad[i].size >= self._threshold:
                 if self._quantization and grad[i].size*4 >= self._partition_byte:
                     self._do_partition_allreduce(i, index, grad, batchid=batchid)
-                elif self._low_rank_decomp:
-                    assert grad[i].size > (self._decomp_rank ** 2), "grad too small!"
-                    self._do_powersgd_allreduce(index[i], grad[i], batchid=batchid)
-                elif self._sparsity:
-                    self._do_allreduce(i, index, grad, batchid=batchid)
+                elif self.engine is not None:
+                    self.engine.do_compressed_communication(index[i], grad[i], state[i])
                 else:
                     self._do_allreduce(i, index, grad, batchid=batchid)
             else:
                 allreduce_(grad[i], average=True, name=str(index[i]), batchid=batchid)
-                # record_timestamp([grad[i]], tensor_name=str(index[i]), op_name="BUPDATE", args=str(batchid))
 
 
     def set_learning_rate(self, lr):
