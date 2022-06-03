@@ -5,15 +5,10 @@ import mxnet as mx
 
 class Compressor(ABC):
     def __init__(self, memory: Memory) -> None:
-        self.decode_params_map = dict()
         self.memory = memory
-    
-    @abstractmethod
-    def memory_compensate(self, index, grad, state):
-        raise NotImplementedError()
 
     @abstractmethod
-    def encode(self, index, compressed_tensor):
+    def encode(self, index, grad, state, compressed_tensor):
         raise NotImplementedError()
 
     @abstractmethod
@@ -21,6 +16,13 @@ class Compressor(ABC):
         raise NotImplementedError()
 
 class SparseCompressor(Compressor):
-    def __init__(self, memory: Memory, s_percent) -> None:
+    def __init__(self, memory: Memory) -> None:
         super().__init__(memory)
-        self.s_percent = s_percent
+    
+    @abstractmethod
+    def _bits_of_compressed_grad(self, grad_size):
+        raise NotImplementedError()
+    
+    @abstractmethod
+    def server_encode(tensor, compressed_tensor):
+        raise NotImplementedError()

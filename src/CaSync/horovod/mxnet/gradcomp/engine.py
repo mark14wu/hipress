@@ -41,7 +41,7 @@ class GradientCompressEngine:
         rootid = index % size()
         compressed_size = int((self.compressor._bits_of_compressed_grad(grad.size)+7)/8) # ceil in uint8
 
-        self.compressor.encode(index, grad, self._comp_gpus[index])
+        self.compressor.encode(index, grad, state, self._comp_gpus[index])
 
         # memcpy for gathering
         if rank() != rootid:

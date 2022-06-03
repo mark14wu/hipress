@@ -76,14 +76,15 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         sparsity_algs = set(['dgc', 'graddrop', 'topkadam'])
         quantization_algs = set(['tbq', 'ecq', 'terngrad', 'mgc'])
         low_rank_decomp_algs = set(['powersgd'])
+        optimizer_compression_algs = set(['topkadam'])
         other_algs = set(['adacomp'])
         supported_algs = functools.reduce(set.union, [
             sparsity_algs,
             quantization_algs,
             low_rank_decomp_algs,
+            optimizer_compression_algs,
             other_algs
         ])
-        optimizer_compression_algs = set(['topkadam'])
         self._optimizer = optimizer
 
         self._compress = None
@@ -184,8 +185,13 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                 self._param_tmp = self._drop_ratio
                 self._compression_rate = lambda x: x*(1-self._drop_ratio)
             elif self._comp_alg == 'topkadam':
+                self._s_percent = kwargs['s_percent'] if 's_percent' in kwargs.keys() else 0.001
+                self._sample_rate = kwargs['sample_rate'] if 'sample_rate' in kwargs.keys() else 0.001
                 self.engine = GradientCompressEngine(
-                    compressor=TopKAdamCompressor(optimizer=self._optimizer)
+                    compressor=TopKAdamCompressor(
+                        optimizer=self._optimizer,
+                        s_percent=self._s_percent,
+                        sample_rate=self._sample_rate)
                 )
             elif self._comp_alg == 'adacomp':
                 self._compress = mx.nd.contrib.ada_comp
@@ -201,10 +207,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                 self._compress = None
                 self._decompress = None
                 self._residual = True
-                if 'rank' in kwargs.keys():
-                    self._decomp_rank = kwargs['rank']
-                else:
-                    self._decomp_rank = 4
+                self._decomp_rank = kwargs['rank'] if 'rank' in kwargs.keys() else 4
                 self.engine = GradientCompressEngine(
                     compressor=PowerSGDCompressor(decomp_rank=self._decomp_rank)
                 )
@@ -418,8 +421,18 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
     def update_multi_precision(self, index, weight, grad, state):
         self.do_allreduce(index, grad, state)
         if self._optimizer_compression:
-            pass
-        self._optimizer.update_multi_precision(index, weight, grad, state)
+            if not isinstance(index, (list, tuple)):
+                index = [index]
+                weight = [weight]
+                grad = [grad]
+                state = [state]
+            for i in range(len(index)):
+                if grad[i].size >= self._threshold:
+                    mx.nd.sgd_update(weight[i], grad[i], out=weight[i], lr=-1.0, wd=0.0)
+                else:
+                    self._optimizer.update_multi_precision(index[i], weight[i], grad[i], state[i])
+        else:
+            self._optimizer.update_multi_precision(index, weight, grad, state)
 
     def do_allreduce(self, index, grad, state, batchid=0):
         if not isinstance(index, (tuple, list)): # Bert or other nlp models

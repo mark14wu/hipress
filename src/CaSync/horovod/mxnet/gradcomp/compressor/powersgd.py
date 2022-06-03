@@ -9,9 +9,6 @@ class PowerSGDCompressor(Compressor):
         super().__init__(PowersgdMemory())
         self.decomp_rank = decomp_rank
 
-    def memory_compensate(self, index, grad, state):
-        pass
-
     def encode(self, index, grad):
         mx.nd.contrib.power_sgd_encode1(
             grad=grad,
