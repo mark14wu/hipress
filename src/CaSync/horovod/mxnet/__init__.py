@@ -357,7 +357,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
             self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
             self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]]
             if self._residual:
-                self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[i]
+                self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[index[i]]
             self._compress(**self._comp_parameters_map[self._comp_alg])
             self._comp_gpus[index[i]][:compressed_size].copyto(self._comp_cpus[index[i]][:compressed_size])
             # print(socket.gethostname(), comp_cpu[i][0:4])
@@ -393,7 +393,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
             self._comp_parameters_map[self._comp_alg]['data'] = grad[i].reshape(grad[i].size)
             self._comp_parameters_map[self._comp_alg]['out'] = self._comp_gpus[index[i]]
             if self._residual:
-                self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[i]
+                self._comp_parameters_map[self._comp_alg]['residual'] = self._resd_gpus[index[i]]
             self._compress(**self._comp_parameters_map[self._comp_alg])
             self._comp_gpus[index[i]][:compressed_size_new].copyto(self._comp_cpus[index[i]][:compressed_size_new])
 
@@ -434,7 +434,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         else:
             self._optimizer.update_multi_precision(index, weight, grad, state)
 
-    def do_allreduce(self, index, grad, state, batchid=0):
+    def do_allreduce(self, index, grad, state):
         if not isinstance(index, (tuple, list)): # Bert or other nlp models
             index = [index]
             grad = [grad]
@@ -447,8 +447,7 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
                 else:
                     self._do_allreduce(i, index, grad, batchid=batchid)
             else:
-                allreduce_(grad[i], average=True, name=str(index[i]), batchid=batchid)
-
+                allreduce_(grad[i], average=True, name=str(index[i]), batchid=0)
 
     def set_learning_rate(self, lr):
         self._optimizer.set_learning_rate(lr)
