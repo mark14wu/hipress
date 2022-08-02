@@ -32,6 +32,12 @@ import threading
 MP_STATUS_CHECK_INTERVAL = 5.0
 TIME_INTERVAL = 1 / 10000
 
+POWERSGD_ENCODE1 = 40
+POWERSGD_ENCODE2 = 50
+POWERSGD_DECODE = 60
+
+HOROVOD_ALLREDUCE_TASK_ID = 30
+
 import time
 import hp_cuda
 import math
@@ -40,7 +46,10 @@ def _hp_cuda_submit_task(name, tensor, residual, B, C, is_root, task_id):
     if residual is None:
         hp_cuda.submit_task(name, tensor, B, C, is_root, task_id)
     else:
-        hp_cuda.submit_task(name, tensor, residual, B, C, is_root, task_id)       
+        hp_cuda.submit_task(name, tensor, residual, B, C, is_root, task_id)
+
+def _hp_cuda_submit_task_powersgd(name, tensor, residual, M, P, Q, task_id):
+    hp_cuda.submit_task(name, tensor, residual, M, P, Q, task_id)
 
 def _malloc_space_xpu( cpu_size : int, gpu_size : int, cpu_type = torch.uint8, gpu_type = torch.uint8):
     _on_gpu = None
@@ -298,8 +307,134 @@ def compression_thread_loop_(input_queue, output_queue, algorithm_name, alg_para
 
     hp_cuda.end()
 
+_allreduce_handles = dict()
+def _malloc_space_powersgd(tensor, low_rank, device_id):
+    grad_numel = tensor.numel()
+    grad_dtype = tensor.dtype
+    interval = math.ceil(math.sqrt(grad_numel))
+
+    _p = torch.zeros((interval, low_rank), dtype=grad_dtype, device=device_id)
+    _q = torch.normal(0, 1, (interval, low_rank), dtype=grad_dtype, device=device_id)
+    _resd = torch.zeros(grad_numel, dtype=grad_dtype, device=device_id)
+    _M = torch.zeros((interval, interval), dtype=grad_dtype, device=device_id)
+
+    return _p, _q, _resd, _M
+
+def powersgd_allreduce_thread_loop_(self, input_queue, output_queue, device_id):
+
+    torch.cuda.set_device(device_id)
+    torch.set_num_threads(1)
+    import time
+
+    last_cycle_time = time.time()
+    while True:
+        start_time = time.time()
+        sleep_time = (last_cycle_time + TIME_INTERVAL - start_time) 
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        last_cycle_time = time.time()
+
+        while not input_queue.empty():
+            r = input_queue.get()
+            index, tensor, name = r
+            print("submit no-comp allreduce", name)
+            handle = allreduce_async_(tensor, average=True, name=name)
+            self._allreduce_handles[name] = handle
+            self._allreduce_index[name] = index
             
+
+def powersgd_compression_thread_loop(self, input_queue, output_queue, algorithm_name, alg_params, hvd_size, hvd_rank, device_id):
+    assert algorithm_name == 'powersgd'
+    torch.cuda.set_device(device_id)
+    torch.set_num_threads(1)
+
+    _comp_res = dict()
+    _comp_p = dict()
+    _comp_q = dict()
+    _comp_M = dict()
+    _comp_set = dict()
+    _index = dict()
+
+    low_rank = alg_params['matrix_approximation_rank']
+    
+    is_need_residual = True
+
+    hp_cuda.init(
+        algorithm_name, 
+        alg_params, 
+        device_id, 
+        hvd_rank, 
+        hvd_size
+    )
+    
+    last_cycle_time = time.time()
+    while True:
+        start_time = time.time()
+        sleep_time = (last_cycle_time + TIME_INTERVAL - start_time) 
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        last_cycle_time = time.time()
+
+        while not input_queue.empty():
+            r = input_queue.get()
+            index, tensor, name = r
+
+            # memory initialize
+            # print("malloc", name)
+            if name not in _comp_set:
+                _comp_p[name], _comp_q[name], _comp_res[name], _comp_M[name] = \
+                    _malloc_space_powersgd(tensor, low_rank, device_id)
             
+            _comp_set[name] = tensor
+            _index[name] = index
+
+            # submit encode1 task
+            # print("submit encode1", name)
+            _hp_cuda_submit_task_powersgd(name, _comp_set[name], _comp_res[name], _comp_M[name], _comp_p[name], _comp_q[name], POWERSGD_ENCODE1)
+
+        # do allreduce after encode1
+        finished_encode1_names = hp_cuda.getResults(POWERSGD_ENCODE1)
+        for name in finished_encode1_names:
+            new_name = name + '_p'
+            # print("submit allreduce1", new_name)
+            handle = allreduce_async_(_comp_p[name], average=True, name=new_name)
+            _allreduce_handles[new_name] = handle
+
+        # do allreduce after encode2
+        finished_encode2_names = hp_cuda.getResults(POWERSGD_ENCODE2)
+        for name in finished_encode2_names:
+            new_name = name + '_q'
+            # print("submit allreduce2", new_name)
+            handle = allreduce_async_(_comp_q[name], average=True, name=new_name)
+            _allreduce_handles[new_name] = handle
+
+        # get names of allreduce1 results
+        finished_allreduce_names = get_all_get_all_finished_keys(task_id=HOROVOD_ALLREDUCE_TASK_ID)
+        for new_name in finished_allreduce_names:
+            if new_name[-2:] == '_p':
+                # allreduce 1
+                name = new_name[:-2]
+                # print("finished allreduce1", new_name)
+                _comp_p[name] = synchronize(_allreduce_handles[new_name])
+                # print("submit encode2", name)
+                _hp_cuda_submit_task_powersgd(name, _comp_set[name], _comp_res[name], _comp_M[name], _comp_p[name], _comp_q[name], POWERSGD_ENCODE2)
+            elif new_name[-2:] == '_q':
+                # allreduce 2
+                name = new_name[:-2]
+                # print("finished allreduce2", new_name)
+                _comp_q[name] = synchronize(_allreduce_handles[new_name])
+                # print("submit decode", name)
+                _hp_cuda_submit_task_powersgd(name, _comp_set[name], _comp_res[name], _comp_M[name], _comp_p[name], _comp_q[name], POWERSGD_DECODE)
+            else:
+                # allreduce for grads < threshold
+                print("finished no-comp allreduce", name)
+                tensor = synchronize(self._allreduce_handles[name])
+                output_queue.put((self._allreduce_index[name], tensor, name, None))
+        
+        # output decode results
+        finished_decode_names = hp_cuda.getResults(POWERSGD_DECODE)
+        for name in finished_decode_names:
+            output_queue.put((_index[name], _comp_set[name], name, None))
 
         
 
@@ -353,7 +488,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._compression_threshold = kargs['threshold']
         self._partition_threshold = kargs['partition_threshold']
         
-        print(self._compression_threshold, self._partition_threshold)
+        print("compression threshold:", self._compression_threshold)
+        print("partition threshold:", self._partition_threshold)
         
         self.algorithm_name = kargs['algorithm_name']
         self.algorithm_params = kargs['algorithm_params']
@@ -367,8 +503,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         elif self.algorithm_name == 'graddrop':
             if 'sample_rate' not in self.algorithm_params or 'drop_ratio' not in self.algorithm_params:
                 print("for terngrad need parameter sample_rate and drop_ratio")
+        elif self.algorithm_name == 'powersgd':
+            if 'matrix_approximation_rank' not in self.algorithm_params:
+                print("for powersgd need matrix_approximation_rank")
         else:
-            print("Not support compression algorithm!!! only support TBQ, terngrad and graddrop")
+            print("Not support compression algorithm!!! only support TBQ, terngrad, graddrop and powersgd")
             raise ValueError
 
         self._size = size()
@@ -392,22 +531,41 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._output_queue = queue.Queue()
 
             #allreduce_thread
-            self._allredeuce_thread = threading.Thread(
-                target=allreduce_thread_loop_,
-                args=(self._allreduce_input_queue, self._output_queue, self._device_id)
-            )
-            self._allredeuce_thread.daemon = True
-            self._allredeuce_thread.start()
 
             #compression_thread
-            self._compression_thread = threading.Thread(
-                target=compression_thread_loop_,
-                args=(
-                    self._compression_input_queue, self._output_queue,
-                    self.algorithm_name, self.algorithm_params, self._size, 
-                    self._rank, self._device_id
+            if self.algorithm_name == 'powersgd':
+                self._allreduce_handles = dict()
+                self._allreduce_index = dict()
+                self._allreduce_thread = threading.Thread(
+                    target=powersgd_allreduce_thread_loop_,
+                    args=(self, self._allreduce_input_queue, self._output_queue, self._device_id)
                 )
-            )
+                self._compression_thread = threading.Thread(
+                    target=powersgd_compression_thread_loop,
+                    args=(
+                        self,
+                        self._compression_input_queue, self._output_queue,
+                        self.algorithm_name, self.algorithm_params, self._size, 
+                        self._rank, self._device_id
+                    )
+                )
+            else:
+                self._allreduce_thread = threading.Thread(
+                    target=allreduce_thread_loop_,
+                    args=(self._allreduce_input_queue, self._output_queue, self._device_id)
+                )
+                self._compression_thread = threading.Thread(
+                    target=compression_thread_loop_,
+                    args=(
+                        self._compression_input_queue, self._output_queue,
+                        self.algorithm_name, self.algorithm_params, self._size, 
+                    self.algorithm_name, self.algorithm_params, self._size, 
+                        self.algorithm_name, self.algorithm_params, self._size, 
+                        self._rank, self._device_id
+                    )
+                )
+            self._allreduce_thread.daemon = True
+            self._allreduce_thread.start()
             self._compression_thread.daemon = True
             self._compression_thread.start()
 

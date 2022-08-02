@@ -3,7 +3,7 @@
 	url = https://gitlab.com/hipress/tensorflow-ops.git
 [submodule "deps/torch-hipress-extension"]
 	path = deps/torch-hipress-extension
-	url = https://gitlab.com/hipress/torch-hipress-extension.git
+	url = https://github.com/mark14wu/torch-hipress-extension.git
 [submodule "deps/mxnet-1.9.0"]
 	path = deps/mxnet-1.9.0
 	url = https://github.com/mark14wu/hipress-mxnet.git
