@@ -8,5 +8,5 @@
 	path = deps/mxnet-1.9.0
 	url = https://github.com/mark14wu/hipress-mxnet.git
 [submodule "src/CCO"]
-	path = src/CCO
+	path = src/CaSync
 	url = git@github.com:sywang0111/CCO.git
